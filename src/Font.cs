@@ -1,64 +1,19 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using SixLabors.Fonts;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using SixLabors.ImageSharp.Drawing.Processing;
 using Silk.NET.OpenGL;
+using ISColor = SixLabors.ImageSharp.Color;
+using SixLaborsFont = SixLabors.Fonts.Font;
 
-/// <summary>Describes the location and layout metrics of a glyph in a <see cref="Font"/> atlas.</summary>
-/// <remarks>
-/// Metrics are expressed at the rasterization size passed to <see cref="Font.FromFile"/>.
-/// <see cref="DesktopWindow.Draw(Font, string, Vector2, Color, float, float)"/> applies the
-/// requested scale at render time.
-/// </remarks>
-public readonly struct GlyphInfo
-{
-    /// <summary>Gets the normalized left texture coordinate.</summary>
-    public float U0 { get; }
-    /// <summary>Gets the normalized top texture coordinate.</summary>
-    public float V0 { get; }
-    /// <summary>Gets the normalized right texture coordinate.</summary>
-    public float U1 { get; }
-    /// <summary>Gets the normalized bottom texture coordinate.</summary>
-    public float V1 { get; }
-    /// <summary>Gets the glyph ink width, in pixels.</summary>
-    public float Width { get; }
-    /// <summary>Gets the glyph ink height, in pixels.</summary>
-    public float Height { get; }
-    /// <summary>Gets the horizontal offset from the pen position to the ink bounds, in pixels.</summary>
-    public float BearingX { get; }
-    /// <summary>Gets the vertical offset from the pen position to the ink bounds, in pixels.</summary>
-    public float BearingY { get; }
-    /// <summary>Gets the horizontal distance to advance the pen after this glyph, in pixels.</summary>
-    public float Advance { get; }
-
-    /// <summary>Initializes a new instance of the <see cref="GlyphInfo"/> structure.</summary>
-    /// <param name="u0">The normalized left texture coordinate.</param>
-    /// <param name="v0">The normalized top texture coordinate.</param>
-    /// <param name="u1">The normalized right texture coordinate.</param>
-    /// <param name="v1">The normalized bottom texture coordinate.</param>
-    /// <param name="width">The glyph ink width, in pixels.</param>
-    /// <param name="height">The glyph ink height, in pixels.</param>
-    /// <param name="bearingX">The horizontal ink offset, in pixels.</param>
-    /// <param name="bearingY">The vertical ink offset, in pixels.</param>
-    /// <param name="advance">The horizontal pen advance, in pixels.</param>
-    public GlyphInfo(float u0, float v0, float u1, float v1, float width, float height, float bearingX, float bearingY, float advance)
-    {
-        U0 = u0;
-        V0 = v0;
-        U1 = u1;
-        V1 = v1;
-        Width = width;
-        Height = height;
-        BearingX = bearingX;
-        BearingY = bearingY;
-        Advance = advance;
-    }
-}
+namespace Breakpoint;
 
 /// <summary>Represents a rasterized glyph atlas and the character metrics required to render text.</summary>
 /// <remarks>
@@ -101,6 +56,7 @@ public sealed class Font : IDisposable
     /// <param name="c">The character to look up.</param>
     /// <param name="glyph">When this method returns <see langword="true"/>, the character metrics.</param>
     /// <returns><see langword="true"/> when <paramref name="c"/> is included in this font; otherwise, <see langword="false"/>.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetGlyph(char c, out GlyphInfo glyph) => _glyphs.TryGetValue(c, out glyph);
 
     /// <summary>Measures the space required to render text with this font.</summary>
@@ -141,126 +97,162 @@ public sealed class Font : IDisposable
     /// <returns>A font containing a texture atlas and metrics for the requested character set.</returns>
     /// <remarks>
     /// This factory does not cache results. Use <see cref="ContentManager.LoadFont"/> for
-    /// cache-backed loading and manager-controlled ownership.
+    /// cache-backed loading and manager-controlled ownership. Glyphs are measured once, packed into
+    /// a single atlas layout, and rasterized directly at their packed position — no intermediate
+    /// per-glyph images are allocated.
     /// </remarks>
+    /// <exception cref="ArgumentException"><paramref name="charset"/> is empty.</exception>
     public static Font FromFile(GL gl, string key, string filePath, float pixelSize, IReadOnlyList<char>? charset = null)
     {
         charset ??= DefaultCharset;
+        if (charset.Count == 0)
+            throw new ArgumentException("El conjunto de caracteres no puede estar vacío.", nameof(charset));
 
         var collection = new FontCollection();
         FontFamily family = collection.Add(filePath);
-        SixLabors.Fonts.Font sixLaborsFont = family.CreateFont(pixelSize, FontStyle.Regular);
+        SixLaborsFont sixLaborsFont = family.CreateFont(pixelSize, FontStyle.Regular);
 
-        var glyphImages = new Dictionary<char, Image<Rgba32>>();
-        var glyphAdvances = new Dictionary<char, float>();
-        var glyphBearings = new Dictionary<char, (float X, float Y)>();
+        GlyphMetrics[] metrics = MeasureGlyphs(sixLaborsFont, charset);
+        AtlasRect?[] positions = PackGlyphs(metrics, AtlasMaxWidth, GlyphPadding, out int atlasWidth, out int atlasHeight);
 
-        try
-        {
-            foreach (char c in charset)
-            {
-                string s = c.ToString();
-                var measureOptions = new TextOptions(sixLaborsFont);
+        using Image<Rgba32> atlasImage = new(Math.Max(1, atlasWidth), Math.Max(1, atlasHeight));
+        RasterizeGlyphs(atlasImage, sixLaborsFont, metrics, positions);
 
-                FontRectangle inkBounds = TextMeasurer.MeasureBounds(s, measureOptions);
-                FontRectangle advanceBounds = TextMeasurer.MeasureAdvance(s, measureOptions);
+        Texture2D texture = Texture2D.FromImage(gl, atlasImage);
+        Dictionary<char, GlyphInfo> glyphs = BuildGlyphLookup(metrics, positions, atlasWidth, atlasHeight);
 
-                glyphAdvances[c] = advanceBounds.Width;
+        // Font metrics use design units, so convert the line height to atlas pixels.
+        FontMetrics fontMetrics = sixLaborsFont.FontMetrics;
+        float lineHeight = fontMetrics.HorizontalMetrics.LineHeight * sixLaborsFont.Size / fontMetrics.UnitsPerEm;
 
-                if (inkBounds.Width <= 0f || inkBounds.Height <= 0f)
-                {
-                    // Whitespace and similar glyphs have no visible ink but still advance the pen.
-                    glyphBearings[c] = (0f, 0f);
-                    continue;
-                }
-
-                int w = Math.Max(1, (int)MathF.Ceiling(inkBounds.Width));
-                int h = Math.Max(1, (int)MathF.Ceiling(inkBounds.Height));
-
-                var glyphImage = new Image<Rgba32>(w, h);
-                var drawOptions = new RichTextOptions(sixLaborsFont)
-                {
-                    Origin = new PointF(-inkBounds.X, -inkBounds.Y)
-                };
-
-                glyphImage.Mutate(ctx => ctx.DrawText(drawOptions, s, SixLabors.ImageSharp.Color.White));
-
-                glyphImages[c] = glyphImage;
-                glyphBearings[c] = (inkBounds.X, inkBounds.Y);
-            }
-
-            var sizes = glyphImages.ToDictionary(kvp => kvp.Key, kvp => (kvp.Value.Width, kvp.Value.Height));
-            var (positions, atlasWidth, atlasHeight) = PackGlyphs(sizes, AtlasMaxWidth, GlyphPadding);
-
-            using var atlasImage = new Image<Rgba32>(Math.Max(1, atlasWidth), Math.Max(1, atlasHeight));
-            atlasImage.Mutate(ctx =>
-            {
-                foreach (var (c, rect) in positions)
-                    ctx.DrawImage(glyphImages[c], new Point(rect.X, rect.Y), 1f);
-            });
-
-            var texture = Texture2D.FromImage(gl, atlasImage);
-
-            var glyphs = new Dictionary<char, GlyphInfo>();
-            foreach (char c in charset)
-            {
-                float advance = glyphAdvances.TryGetValue(c, out var a) ? a : 0f;
-                var (bearingX, bearingY) = glyphBearings.TryGetValue(c, out var b) ? b : (0f, 0f);
-
-                if (positions.TryGetValue(c, out var rect))
-                {
-                    float u0 = rect.X / (float)atlasWidth;
-                    float v0 = rect.Y / (float)atlasHeight;
-                    float u1 = (rect.X + rect.Width) / (float)atlasWidth;
-                    float v1 = (rect.Y + rect.Height) / (float)atlasHeight;
-
-                    glyphs[c] = new GlyphInfo(u0, v0, u1, v1, rect.Width, rect.Height, bearingX, bearingY, advance);
-                }
-                else
-                {
-                    glyphs[c] = new GlyphInfo(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, advance);
-                }
-            }
-
-            // Font metrics use design units, so convert the line height to atlas pixels.
-            float lineHeight = sixLaborsFont.FontMetrics.LineHeight * sixLaborsFont.Size / sixLaborsFont.FontMetrics.UnitsPerEm;
-
-            return new Font(key, texture, lineHeight, glyphs);
-        }
-        finally
-        {
-            foreach (var image in glyphImages.Values)
-                image.Dispose();
-        }
+        return new Font(key, texture, lineHeight, glyphs);
     }
 
-    /// <summary>Packs rasterized glyph rectangles into rows within a fixed-width texture atlas.</summary>
-    /// <remarks>Glyphs are sorted by height to reduce unused row space. This runs only during font creation.</remarks>
-    private static (Dictionary<char, AtlasRect> Positions, int Width, int Height) PackGlyphs(
-        Dictionary<char, (int Width, int Height)> sizes, int maxWidth, int padding)
+    /// <summary>Measures the ink bounds and advance width of every character in a charset.</summary>
+    /// <remarks>This runs once per font load and does not rasterize anything.</remarks>
+    private static GlyphMetrics[] MeasureGlyphs(SixLaborsFont font, IReadOnlyList<char> charset)
     {
-        var positions = new Dictionary<char, AtlasRect>();
-        int x = 0, y = 0, rowHeight = 0;
+        var measureOptions = new TextOptions(font);
+        var metrics = new GlyphMetrics[charset.Count];
 
-        // Shelf packing is ordered from tallest to shortest to reduce unused row space.
-        foreach (var kvp in sizes.OrderByDescending(k => k.Value.Height))
+        for (int i = 0; i < charset.Count; i++)
         {
-            var (w, h) = kvp.Value;
+            char c = charset[i];
+            string text = c.ToString();
 
-            if (x + w > maxWidth)
+            FontRectangle inkBounds = TextMeasurer.MeasureBounds(text, measureOptions);
+            FontRectangle advanceBounds = TextMeasurer.MeasureAdvance(text, measureOptions);
+
+            if (inkBounds.Width <= 0f || inkBounds.Height <= 0f)
+            {
+                // Whitespace and similar glyphs have no visible ink but still advance the pen.
+                metrics[i] = new GlyphMetrics(c, text, advanceBounds.Width, 0f, 0f, 0, 0);
+            }
+            else
+            {
+                int width = Math.Max(1, (int)MathF.Ceiling(inkBounds.Width));
+                int height = Math.Max(1, (int)MathF.Ceiling(inkBounds.Height));
+                metrics[i] = new GlyphMetrics(c, text, advanceBounds.Width, inkBounds.X, inkBounds.Y, width, height);
+            }
+        }
+
+        return metrics;
+    }
+
+    /// <summary>Packs glyph ink rectangles into rows within a fixed-width texture atlas.</summary>
+    /// <remarks>Glyphs are packed tallest-first to reduce unused row space. This runs once per font load.</remarks>
+    private static AtlasRect?[] PackGlyphs(GlyphMetrics[] metrics, int maxWidth, int padding, out int atlasWidth, out int atlasHeight)
+    {
+        var positions = new AtlasRect?[metrics.Length];
+
+        int[] order = Enumerable.Range(0, metrics.Length)
+            .Where(i => metrics[i].InkWidth > 0)
+            .OrderByDescending(i => metrics[i].InkHeight)
+            .ToArray();
+
+        int x = 0, y = 0, rowHeight = 0;
+        foreach (int i in order)
+        {
+            ref readonly GlyphMetrics m = ref metrics[i];
+
+            if (x + m.InkWidth > maxWidth)
             {
                 x = 0;
                 y += rowHeight + padding;
                 rowHeight = 0;
             }
 
-            positions[kvp.Key] = new AtlasRect(x, y, w, h);
-            x += w + padding;
-            rowHeight = Math.Max(rowHeight, h);
+            positions[i] = new AtlasRect(x, y, m.InkWidth, m.InkHeight);
+            x += m.InkWidth + padding;
+            rowHeight = Math.Max(rowHeight, m.InkHeight);
         }
 
-        int atlasHeight = y + rowHeight;
-        return (positions, maxWidth, atlasHeight);
+        atlasWidth = maxWidth;
+        atlasHeight = Math.Max(1, y + rowHeight);
+        return positions;
+    }
+
+    /// <summary>Draws every packed glyph directly onto the atlas image at its assigned position.</summary>
+    /// <remarks>
+    /// A single <see cref="RichTextOptions"/> and <see cref="Brush"/> instance is reused across all
+    /// glyphs; only <see cref="RichTextOptions.Origin"/> changes per glyph. No intermediate per-glyph
+    /// images are created.
+    /// </remarks>
+    private static void RasterizeGlyphs(Image<Rgba32> atlasImage, SixLaborsFont font, GlyphMetrics[] metrics, AtlasRect?[] positions)
+    {
+        var drawOptions = new RichTextOptions(font);
+        SolidBrush brush = Brushes.Solid(ISColor.White);
+
+        atlasImage.Mutate(ctx =>
+        {
+            ctx.Paint(canvas =>
+            {
+                for (int i = 0; i < metrics.Length; i++)
+                {
+                    if (positions[i] is not { } rect)
+                        continue;
+
+                    ref readonly GlyphMetrics m = ref metrics[i];
+
+                    drawOptions.Origin = new PointF(
+                        rect.X - m.BearingX,
+                        rect.Y - m.BearingY);
+
+                    canvas.DrawText(
+                        drawOptions,
+                        m.Text,
+                        brush,
+                        null);
+                }
+            });
+        });
+    }
+
+    /// <summary>Builds the final per-character glyph metrics lookup from measured and packed data.</summary>
+    private static Dictionary<char, GlyphInfo> BuildGlyphLookup(GlyphMetrics[] metrics, AtlasRect?[] positions, int atlasWidth, int atlasHeight)
+    {
+        var glyphs = new Dictionary<char, GlyphInfo>(metrics.Length);
+
+        for (int i = 0; i < metrics.Length; i++)
+        {
+            ref readonly GlyphMetrics m = ref metrics[i];
+
+            if (positions[i] is { } rect)
+            {
+                float u0 = rect.X / (float)atlasWidth;
+                float v0 = rect.Y / (float)atlasHeight;
+                float u1 = (rect.X + rect.Width) / (float)atlasWidth;
+                float v1 = (rect.Y + rect.Height) / (float)atlasHeight;
+
+                glyphs[m.Character] = new GlyphInfo(u0, v0, u1, v1, rect.Width, rect.Height, m.BearingX, m.BearingY, m.Advance);
+            }
+            else
+            {
+                glyphs[m.Character] = new GlyphInfo(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, m.Advance);
+            }
+        }
+
+        return glyphs;
     }
 
     /// <summary>Builds the inclusive printable ASCII range used by default font creation.</summary>
@@ -273,9 +265,6 @@ public sealed class Font : IDisposable
         return chars;
     }
 
-    /// <summary>Represents the pixel bounds assigned to a glyph in the atlas.</summary>
-    private readonly record struct AtlasRect(int X, int Y, int Width, int Height);
-
     /// <summary>Disposes the GPU texture atlas owned by this font.</summary>
     /// <remarks>This method is idempotent.</remarks>
     public void Dispose()
@@ -286,4 +275,17 @@ public sealed class Font : IDisposable
         Texture.Dispose();
         _disposed = true;
     }
+
+    /// <summary>Holds the measured, pre-rasterization metrics of a single character.</summary>
+    /// <param name="Character">The measured character.</param>
+    /// <param name="Text">A cached single-character string, reused for measuring and drawing to avoid repeated allocation.</param>
+    /// <param name="Advance">The horizontal pen advance, in pixels.</param>
+    /// <param name="BearingX">The horizontal ink offset from the pen position, in pixels.</param>
+    /// <param name="BearingY">The vertical ink offset from the pen position, in pixels.</param>
+    /// <param name="InkWidth">The ceiling-rounded ink width, in pixels, or <c>0</c> for glyphs with no visible ink.</param>
+    /// <param name="InkHeight">The ceiling-rounded ink height, in pixels, or <c>0</c> for glyphs with no visible ink.</param>
+    private readonly record struct GlyphMetrics(char Character, string Text, float Advance, float BearingX, float BearingY, int InkWidth, int InkHeight);
+
+    /// <summary>Represents the pixel bounds assigned to a glyph in the atlas.</summary>
+    private readonly record struct AtlasRect(int X, int Y, int Width, int Height);
 }

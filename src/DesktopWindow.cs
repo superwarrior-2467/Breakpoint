@@ -6,14 +6,16 @@ using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
 
+namespace Breakpoint;
+
 /// <summary>
 /// Provides a Silk.NET-backed desktop window with queued sprite and text rendering.
 /// </summary>
 /// <remarks>
 /// Configure window properties before calling <see cref="Run"/>. The <see cref="Loaded"/> event
 /// is raised after the OpenGL context, input system, and <see cref="Content"/> manager are ready.
-/// During each frame, <see cref="Rendered"/> is raised before queued <see cref="Draw"/> calls are
-/// flushed. This type is intended for use from the window's event thread.
+/// During each frame, <see cref="Rendered"/> is raised before queued <see cref="Draw(Texture2D, Vector2, Vector2)"/>
+/// calls are flushed. This type is intended for use from the window's event thread.
 /// </remarks>
 /// <example>
 /// <code>
@@ -33,13 +35,13 @@ public sealed class DesktopWindow : IDisposable
     public string Title { get; set; } = "UBI";
 
     /// <summary>Gets or sets the native window border and resize behavior.</summary>
-    public Silk.NET.Windowing.WindowBorder WindowBorder { get; set; } = Silk.NET.Windowing.WindowBorder.Resizable;
+    public WindowBorder WindowBorder { get; set; } = WindowBorder.Resizable;
     /// <summary>Gets or sets whether the framebuffer is created with transparency support.</summary>
     public bool TransparentBackground { get; set; } = false;
     /// <summary>Gets or sets whether the native window remains above non-topmost windows.</summary>
     public bool TopMost { get; set; } = false;
     /// <summary>Gets or sets the initial native window state.</summary>
-    public Silk.NET.Windowing.WindowState WindowState { get; set; } = Silk.NET.Windowing.WindowState.Normal;
+    public WindowState WindowState { get; set; } = WindowState.Normal;
 
     /// <summary>Gets or sets the RGBA color used to clear the framebuffer at the start of each frame.</summary>
     public Vector4 ClearColor { get; set; } = new(0f, 0f, 0f, 1f);
@@ -85,33 +87,21 @@ public sealed class DesktopWindow : IDisposable
     private readonly List<TextCommand> _textDrawQueue = new();
 
     // Sprite rendering pipeline resources.
-    /// <summary>The linked OpenGL shader program used to render sprites.</summary>
     private uint _shaderProgram;
-    /// <summary>The vertex-array object that describes the sprite vertex layout.</summary>
     private uint _vao;
-    /// <summary>The dynamic vertex buffer used for one sprite quad.</summary>
     private uint _vbo;
-    /// <summary>The element buffer containing the sprite quad indices.</summary>
     private uint _ebo;
-    /// <summary>The location of the sprite texture sampler uniform.</summary>
     private int _uTextureLocation;
 
     // Text rendering pipeline resources.
-    /// <summary>The linked OpenGL shader program used to render glyph coverage from texture atlases.</summary>
     private uint _textShaderProgram;
-    /// <summary>The vertex-array object that describes the text vertex layout.</summary>
     private uint _textVao;
-    /// <summary>The dynamic vertex buffer used for batched text glyphs.</summary>
     private uint _textVbo;
-    /// <summary>The dynamic element buffer used for batched text glyphs.</summary>
     private uint _textEbo;
-    /// <summary>The location of the text atlas sampler uniform.</summary>
     private int _uTextTextureLocation;
 
     // Reusable text-batching buffers grow on demand and are retained to avoid steady-state allocations.
-    /// <summary>Managed vertex staging buffer used to assemble text batches before GPU upload.</summary>
     private float[] _textVertexBuffer = new float[256 * 4 * TextVertexFloats];
-    /// <summary>Managed index staging buffer used to assemble text batches before GPU upload.</summary>
     private uint[] _textIndexBuffer = new uint[256 * 6];
 
     /// <summary>The number of float values in one text vertex: position, UV coordinates, and color.</summary>
@@ -128,7 +118,7 @@ public sealed class DesktopWindow : IDisposable
     /// <summary>Creates a point-in-time copy of the currently pressed keyboard keys and mouse buttons.</summary>
     /// <returns>An input snapshot that is unaffected by subsequent input events.</returns>
     public InputSnapshot GetPressedInputs()
-        => new InputSnapshot(_pressedKeys.ToArray(), _pressedMouseButtons.ToArray());
+        => new(_pressedKeys.ToArray(), _pressedMouseButtons.ToArray());
 
     /// <summary>Creates the native window and starts its event loop.</summary>
     /// <exception cref="InvalidOperationException">The window has already been started.</exception>
@@ -183,8 +173,6 @@ public sealed class DesktopWindow : IDisposable
         Draw(_content.GetTexture(textureKey), position, size);
     }
 
-    // Convenience overloads keep the common text-rendering call concise.
-
     /// <summary>Queues unscaled, unrotated white text for rendering during the current frame.</summary>
     /// <param name="font">The font that supplies the glyph atlas and metrics.</param>
     /// <param name="text">The text to render.</param>
@@ -226,12 +214,8 @@ public sealed class DesktopWindow : IDisposable
     }
 
     /// <summary>Determines whether a keyboard key is currently pressed.</summary>
-    /// <param name="key">The Silk.NET key to test.</param>
-    /// <returns><see langword="true"/> when the key is pressed; otherwise, <see langword="false"/>.</returns>
     public bool IsKeyDown(Key key) => _pressedKeys.Contains(key);
     /// <summary>Determines whether a mouse button is currently pressed.</summary>
-    /// <param name="button">The Silk.NET mouse button to test.</param>
-    /// <returns><see langword="true"/> when the button is pressed; otherwise, <see langword="false"/>.</returns>
     public bool IsMouseButtonDown(MouseButton button) => _pressedMouseButtons.Contains(button);
 
     /// <summary>Requests that the native window close.</summary>
@@ -300,25 +284,10 @@ public sealed class DesktopWindow : IDisposable
         _input = null;
     }
 
-    /// <summary>Records a keyboard press reported by Silk.NET.</summary>
-    {
-        _pressedKeys.Add(key);
-    }
-
-    /// <summary>Removes a released key from the current input state.</summary>
-    {
-        _pressedKeys.Remove(key);
-    }
-
-    /// <summary>Records a mouse-button press reported by Silk.NET.</summary>
-    {
-        _pressedMouseButtons.Add(button);
-    }
-
-    /// <summary>Removes a released mouse button from the current input state.</summary>
-    {
-        _pressedMouseButtons.Remove(button);
-    }
+    private void OnKeyDown(IKeyboard keyboard, Key key, int scanCode) => _pressedKeys.Add(key);
+    private void OnKeyUp(IKeyboard keyboard, Key key, int scanCode) => _pressedKeys.Remove(key);
+    private void OnMouseDown(IMouse mouse, MouseButton button) => _pressedMouseButtons.Add(button);
+    private void OnMouseUp(IMouse mouse, MouseButton button) => _pressedMouseButtons.Remove(button);
 
     /// <summary>Creates the shader programs and GPU buffers used by sprite and text rendering.</summary>
     /// <exception cref="Exception">A sprite or text shader fails to compile or link.</exception>
@@ -636,6 +605,7 @@ public sealed class DesktopWindow : IDisposable
     }
 
     /// <summary>Counts visible glyph quads that a text command will contribute to a batch.</summary>
+    private static int CountRenderableGlyphs(TextCommand cmd)
     {
         int count = 0;
         foreach (char c in cmd.Text)
@@ -650,6 +620,13 @@ public sealed class DesktopWindow : IDisposable
     }
 
     /// <summary>Appends the renderable glyphs of a command to the reusable batch buffers.</summary>
+    private void AppendTextCommand(
+        TextCommand cmd,
+        int screenWidth,
+        int screenHeight,
+        ref int vertexFloatIndex,
+        ref int indexIntIndex,
+        ref uint quadCounter)
     {
         float penX = 0f;
         float penY = 0f;

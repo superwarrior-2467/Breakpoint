@@ -20,3 +20,5 @@ packages/
 
 *.yaml
 *.DotSettings
+
+*.lic

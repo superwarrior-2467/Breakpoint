@@ -1,9 +1,12 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
-using System.IO;
+using System.Runtime.CompilerServices;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using Silk.NET.OpenGL;
+
+namespace Breakpoint;
 
 /// <summary>
 /// Loads, caches, and owns texture and font resources associated with an OpenGL context.
@@ -50,6 +53,7 @@ public sealed class ContentManager : IDisposable
     /// <param name="key">The case-insensitive cache key.</param>
     /// <returns>The cached texture.</returns>
     /// <exception cref="KeyNotFoundException">No texture is cached under <paramref name="key"/>.</exception>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Texture2D GetTexture(string key)
     {
         if (!_textures.TryGetValue(key, out var texture))
@@ -80,6 +84,7 @@ public sealed class ContentManager : IDisposable
     /// <param name="key">The case-insensitive cache key.</param>
     /// <returns>The cached font.</returns>
     /// <exception cref="KeyNotFoundException">No font is cached under <paramref name="key"/>.</exception>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Font GetFont(string key)
     {
         if (!_fonts.TryGetValue(key, out var font))
@@ -146,13 +151,48 @@ public sealed class Texture2D : IDisposable
     /// <returns>A newly created GPU texture with linear filtering and clamp-to-edge wrapping.</returns>
     /// <remarks>
     /// This method is shared by file-based texture loading and <see cref="Font"/> atlas creation.
-    /// It uploads pixels immediately and generates mipmaps before returning.
+    /// When <paramref name="image"/> exposes a single contiguous pixel buffer (the common case),
+    /// pixel data is uploaded directly from it with no intermediate copy. Otherwise, a pooled
+    /// buffer is used to stage the pixel data before upload. Mipmaps are generated before returning.
     /// </remarks>
     public static unsafe Texture2D FromImage(GL gl, Image<Rgba32> image)
     {
-        byte[] pixelData = new byte[image.Width * image.Height * 4];
-        image.CopyPixelDataTo(pixelData);
+        int byteCount = image.Width * image.Height * 4;
 
+        Texture2D texture;
+        if (image.DangerousTryGetSinglePixelMemory(out Memory<Rgba32> pixelMemory))
+        {
+            using MemoryHandle handle = pixelMemory.Pin();
+            texture = UploadPixels(gl, (byte*)handle.Pointer, image.Width, image.Height);
+        }
+        else
+        {
+            byte[] rented = ArrayPool<byte>.Shared.Rent(byteCount);
+            try
+            {
+                image.CopyPixelDataTo(rented.AsSpan(0, byteCount));
+                fixed (byte* ptr = rented)
+                {
+                    texture = UploadPixels(gl, ptr, image.Width, image.Height);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        return texture;
+    }
+
+    /// <summary>Creates and uploads an OpenGL texture from a raw RGBA8 pixel buffer.</summary>
+    /// <param name="gl">The OpenGL API used to create the texture.</param>
+    /// <param name="pixels">A pointer to at least <paramref name="width"/> * <paramref name="height"/> * 4 bytes of tightly packed RGBA8 pixel data.</param>
+    /// <param name="width">The texture width, in pixels.</param>
+    /// <param name="height">The texture height, in pixels.</param>
+    /// <returns>A newly created GPU texture with linear filtering, clamp-to-edge wrapping, and mipmaps.</returns>
+    private static unsafe Texture2D UploadPixels(GL gl, byte* pixels, int width, int height)
+    {
         uint handle = gl.GenTexture();
         gl.BindTexture(TextureTarget.Texture2D, handle);
 
@@ -161,24 +201,21 @@ public sealed class Texture2D : IDisposable
         gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
         gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
 
-        fixed (byte* ptr = pixelData)
-        {
-            gl.TexImage2D(
-                TextureTarget.Texture2D,
-                0,
-                InternalFormat.Rgba,
-                (uint)image.Width,
-                (uint)image.Height,
-                0,
-                PixelFormat.Rgba,
-                PixelType.UnsignedByte,
-                ptr);
-        }
+        gl.TexImage2D(
+            TextureTarget.Texture2D,
+            0,
+            InternalFormat.Rgba,
+            (uint)width,
+            (uint)height,
+            0,
+            PixelFormat.Rgba,
+            PixelType.UnsignedByte,
+            pixels);
 
         gl.GenerateMipmap(TextureTarget.Texture2D);
         gl.BindTexture(TextureTarget.Texture2D, 0);
 
-        return new Texture2D(gl, handle, image.Width, image.Height);
+        return new Texture2D(gl, handle, width, height);
     }
 
     /// <summary>Releases the underlying OpenGL texture object.</summary>
